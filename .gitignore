@@ -1,5 +1,6 @@
 .claude
 run.out
+.DS_Store
 
 # Python
 # Byte-compiled / optimized / DLL files
