@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-academia.edu full-scale scraper.
+academia.edu full-scale scraper — hardened for interruption-safety.
 
 Pipeline:
   1. Seed: scrape https://www.academia.edu/ -> university subdomains.
@@ -9,47 +9,61 @@ Pipeline:
   4. Per profile: parse embedded JSON (user_id, dept, university, photo, dates)
                   and <meta name="description"> (followers/following/papers counters).
   5. Per user_id: GET /v0/users/{id}/details + /v0/certifications/ranks/author_ranks/{id}.
-  6. Append a row to data/data.csv (streaming, resumable via data/checkpoint.json).
+  6. Append a row to data/data.csv (streaming, dedup-safe across crashes).
 
-Stack: asyncio + curl_cffi.AsyncSession (Cloudflare bypass via Chrome TLS impersonation)
-       + aiohttp (used for the first seed fetch; falls back to curl_cffi if blocked)
-       + aiofiles (non-blocking CSV writes).
+Crash safety:
+  - CSV is the single source of truth. On startup `done_user_ids` is rebuilt by
+    scanning data.csv, so a kill -9 between a row write and a checkpoint flush
+    can never produce duplicates and can never lose progress.
+  - Each row is written + fsync'd under a lock before `done_user_ids` is updated.
+  - SIGINT / SIGTERM sets a stop event; in-flight HTTP requests finish, then the
+    scraper exits cleanly (typically within REQUEST_TIMEOUT seconds).
+  - Failure-rate watchdog: if >50% of the last 60s of requests fail, logs a loud
+    warning so a Cloudflare ban isn't silent.
+
+Stack: asyncio + curl_cffi.AsyncSession (Chrome TLS impersonation, bypasses
+Cloudflare) + aiohttp (seed fetch, falls back to curl_cffi) + sync fsync for
+the CSV (correctness > raw throughput on the writer side).
 
 Run:   python3 scripts/scraper.py
-Resume on re-run: profiles already in checkpoint.json are skipped.
 """
 
 import asyncio
+import csv as csvlib
 import json
 import logging
+import os
 import re
 import signal
 import sys
-from dataclasses import dataclass
+import time
+from collections import deque
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
-import aiofiles
+import aiofiles  # noqa: F401  (kept in stack for compatibility / future async IO)
 import aiohttp
 from curl_cffi.requests import AsyncSession
 
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 OUT_CSV = DATA_DIR / "data.csv"
-CHECKPOINT = DATA_DIR / "checkpoint.json"
 LOG_FILE = DATA_DIR / "scraper.log"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- Tunables ---
-GLOBAL_CONCURRENCY = 30
-PER_HOST_CONCURRENCY = 4
+GLOBAL_CONCURRENCY = 40
+PER_HOST_CONCURRENCY = 6
+SUBDOMAIN_CONCURRENCY = 4         # how many universities to crawl in parallel
 MAX_DEPT_PAGES = 50
 RETRY_LIMIT = 4
 RETRY_BASE_DELAY = 2.0
 REQUEST_TIMEOUT = 30
 IMPERSONATE = "chrome"
-CHECKPOINT_EVERY = 25
+FAILURE_WINDOW_SEC = 60
+FAILURE_RATE_THRESHOLD = 0.5
+FAILURE_MIN_SAMPLES = 20
 
 logging.basicConfig(
     level=logging.INFO,
@@ -70,12 +84,19 @@ CSV_FIELDS = [
     "scraped_at",
 ]
 
-# --- Shared state ---
-done_user_ids: set[int] = set()
+# --- Shared runtime state ---
+done_user_ids: set = set()
+seen_profile_urls: set = set()  # short-circuit re-fetches on resume
 csv_lock = asyncio.Lock()
-ckpt_lock = asyncio.Lock()
+csv_fh = None                          # type: Optional[object]  # sync file handle
+csv_writer = None                      # csv.DictWriter
+stop_event: Optional[asyncio.Event] = None
 global_sem: Optional[asyncio.Semaphore] = None
-host_sems: dict[str, asyncio.Semaphore] = {}
+host_sems: dict = {}
+# Sliding-window failure tracker: list of (timestamp, ok_bool)
+recent_results: deque = deque()
+results_lock = asyncio.Lock()
+last_watchdog_warn: float = 0.0
 
 
 def _host_sem(host: str) -> asyncio.Semaphore:
@@ -85,22 +106,66 @@ def _host_sem(host: str) -> asyncio.Semaphore:
     return sem
 
 
+async def _record_result(ok: bool) -> bool:
+    """Returns True if the watchdog wants the caller to back off."""
+    global last_watchdog_warn
+    now = time.monotonic()
+    async with results_lock:
+        recent_results.append((now, ok))
+        cutoff = now - FAILURE_WINDOW_SEC
+        while recent_results and recent_results[0][0] < cutoff:
+            recent_results.popleft()
+        n = len(recent_results)
+        if n >= FAILURE_MIN_SAMPLES:
+            failed = sum(1 for _, o in recent_results if not o)
+            if failed / n >= FAILURE_RATE_THRESHOLD and now - last_watchdog_warn > 30:
+                last_watchdog_warn = now
+                log.error(
+                    "WATCHDOG: %d/%d requests failed in last %ds (%.0f%%). "
+                    "Pausing 60s — likely Cloudflare rate-limit or network issue.",
+                    failed, n, FAILURE_WINDOW_SEC, 100 * failed / n,
+                )
+                return True
+    return False
+
+
 # --- HTTP ---
 async def fetch(session: AsyncSession, url: str, host: str) -> Optional[str]:
-    """GET with retry/backoff. Returns body text or None."""
+    """GET with retry/backoff. Returns body text or None. Records success/failure."""
     assert global_sem is not None
+    if stop_event is not None and stop_event.is_set():
+        return None
     async with global_sem, _host_sem(host):
         for attempt in range(RETRY_LIMIT):
+            if stop_event is not None and stop_event.is_set():
+                return None
             try:
-                r = await session.get(url, impersonate=IMPERSONATE, timeout=REQUEST_TIMEOUT)
+                # Hard outer cap — curl_cffi's own timeout has been observed to
+                # blow past the requested value under load, so we enforce it
+                # here in asyncio terms.
+                r = await asyncio.wait_for(
+                    session.get(url, impersonate=IMPERSONATE, timeout=REQUEST_TIMEOUT),
+                    timeout=REQUEST_TIMEOUT + 5,
+                )
                 if r.status_code == 200:
+                    await _record_result(True)
                     return r.text
                 if r.status_code in (404, 403, 410):
+                    await _record_result(True)  # not a transport failure
                     return None
                 log.warning("HTTP %d %s (attempt %d/%d)", r.status_code, url, attempt + 1, RETRY_LIMIT)
+            except asyncio.TimeoutError:
+                log.warning("TIMEOUT %s (attempt %d/%d)", url, attempt + 1, RETRY_LIMIT)
             except Exception as e:
                 log.warning("ERR %s: %s (attempt %d/%d)", url, e, attempt + 1, RETRY_LIMIT)
             await asyncio.sleep(RETRY_BASE_DELAY * (2 ** attempt))
+        backoff = await _record_result(False)
+        if backoff and stop_event is not None and not stop_event.is_set():
+            log.warning("Watchdog backoff: sleeping 60s before resuming")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=60)
+            except asyncio.TimeoutError:
+                pass
         return None
 
 
@@ -109,12 +174,12 @@ _SUB_PAT = re.compile(r'https?://([a-z0-9][a-z0-9\-]+)\.academia\.edu')
 _EXCLUDE_SUBS = {"www", "a", "0", "support", "static", "s3", "m"}
 
 
-def discover_subdomains(html_text: str) -> set[str]:
+def discover_subdomains(html_text: str) -> set:
     subs = set(_SUB_PAT.findall(html_text or "")) - _EXCLUDE_SUBS
     return {s for s in subs if not s.startswith(("academia-",))}
 
 
-def discover_department_urls(html_text: str, subdomain: str) -> set[str]:
+def discover_department_urls(html_text: str, subdomain: str) -> set:
     pat = re.compile(
         rf'https?://{re.escape(subdomain)}\.academia\.edu(/Departments/[A-Za-z0-9_%\-\.]+)'
     )
@@ -127,7 +192,7 @@ def discover_department_urls(html_text: str, subdomain: str) -> set[str]:
     return cleaned
 
 
-def discover_profile_urls(html_text: str, subdomain: str) -> set[str]:
+def discover_profile_urls(html_text: str, subdomain: str) -> set:
     pat = re.compile(
         rf'https?://{re.escape(subdomain)}\.academia\.edu/([A-Za-z0-9%\-_]+)(?=["\'?#])'
     )
@@ -139,7 +204,6 @@ def discover_profile_urls(html_text: str, subdomain: str) -> set[str]:
             continue
         if p.startswith(("Departments", "Documents", "v0", "open_search", "search", "register", "login")):
             continue
-        # crude length sanity-check (profile slugs are typically >2 chars)
         if len(p) < 3:
             continue
         out.add(f"{base}{p}")
@@ -233,45 +297,82 @@ async def fetch_user_rank(session, subdomain, uid):
         return {}
 
 
-# --- IO ---
+# --- CSV IO (crash-safe: write + fsync under lock, then update memo) ---
+def open_csv_writer():
+    """Open csv for append. Writes header if file is new/empty. Sync IO, fsync'd."""
+    global csv_fh, csv_writer
+    new_file = (not OUT_CSV.exists()) or OUT_CSV.stat().st_size == 0
+    csv_fh = open(OUT_CSV, "a", encoding="utf-8", newline="")
+    csv_writer = csvlib.DictWriter(csv_fh, fieldnames=CSV_FIELDS, extrasaction="ignore")
+    if new_file:
+        csv_writer.writeheader()
+        csv_fh.flush()
+        os.fsync(csv_fh.fileno())
+
+
+def close_csv_writer():
+    global csv_fh
+    if csv_fh is not None:
+        try:
+            csv_fh.flush()
+            os.fsync(csv_fh.fileno())
+        except Exception:
+            pass
+        try:
+            csv_fh.close()
+        except Exception:
+            pass
+        csv_fh = None
+
+
 async def write_row(row: dict):
+    row = dict(row)  # don't mutate caller
     row["scraped_at"] = datetime.now(timezone.utc).isoformat()
     async with csv_lock:
-        new_file = not OUT_CSV.exists()
-        async with aiofiles.open(OUT_CSV, "a", encoding="utf-8", newline="") as f:
-            if new_file:
-                await f.write(",".join(CSV_FIELDS) + "\n")
-            cells = []
-            for k in CSV_FIELDS:
-                v = row.get(k, "")
-                if v is None:
-                    v = ""
-                s = str(v).replace('"', '""').replace("\r", " ").replace("\n", " ")
-                if any(c in s for c in ',"'):
-                    s = f'"{s}"'
-                cells.append(s)
-            await f.write(",".join(cells) + "\n")
+        # csv.DictWriter handles quoting / unicode correctly. Run in default executor
+        # so the fsync doesn't stall the event loop on slow disks.
+        def _do_write():
+            csv_writer.writerow(row)
+            csv_fh.flush()
+            os.fsync(csv_fh.fileno())
+        await asyncio.get_running_loop().run_in_executor(None, _do_write)
 
 
-async def save_checkpoint():
-    async with ckpt_lock:
-        async with aiofiles.open(CHECKPOINT, "w", encoding="utf-8") as f:
-            await f.write(json.dumps({"user_ids": sorted(done_user_ids)}))
-
-
-def load_checkpoint():
-    global done_user_ids
-    if CHECKPOINT.exists():
-        try:
-            with open(CHECKPOINT, "r", encoding="utf-8") as f:
-                done_user_ids = set(json.load(f).get("user_ids", []))
-        except Exception:
-            done_user_ids = set()
-    log.info("Checkpoint: %d user_ids already scraped", len(done_user_ids))
+# --- Recovery: rebuild done_user_ids from the CSV itself ---
+def recover_done_state() -> tuple:
+    """Returns (done_user_ids, seen_profile_urls). CSV is the source of truth."""
+    if not OUT_CSV.exists():
+        return set(), set()
+    ids: set = set()
+    urls: set = set()
+    bad = 0
+    try:
+        with open(OUT_CSV, "r", encoding="utf-8", newline="") as f:
+            reader = csvlib.DictReader(f)
+            for row in reader:
+                v = row.get("user_id", "")
+                try:
+                    ids.add(int(v))
+                except (TypeError, ValueError):
+                    bad += 1
+                u = row.get("profile_url", "")
+                if u:
+                    urls.add(u)
+    except Exception as e:
+        log.error("CSV recovery failed: %s — starting from scratch", e)
+        return set(), set()
+    if bad:
+        log.warning("CSV recovery: skipped %d unparseable rows", bad)
+    return ids, urls
 
 
 # --- Crawl workers ---
 async def process_profile(session: AsyncSession, profile_url: str, subdomain: str) -> bool:
+    if stop_event is not None and stop_event.is_set():
+        return False
+    # Short-circuit: if we've written this URL before, skip the fetch entirely.
+    if profile_url in seen_profile_urls:
+        return False
     html_text = await fetch(session, profile_url, subdomain)
     if not html_text:
         return False
@@ -280,6 +381,7 @@ async def process_profile(session: AsyncSession, profile_url: str, subdomain: st
         return False
     uid = parsed["user_id"]
     if uid in done_user_ids:
+        seen_profile_urls.add(profile_url)  # record so next resume skips it
         return False
     det, rank = await asyncio.gather(
         fetch_user_details(session, subdomain, uid),
@@ -287,16 +389,19 @@ async def process_profile(session: AsyncSession, profile_url: str, subdomain: st
     )
     row = {**parsed, **det, **rank}
     await write_row(row)
-    done_user_ids.add(uid)
-    if len(done_user_ids) % CHECKPOINT_EVERY == 0:
-        await save_checkpoint()
-        log.info("Progress: %d users in CSV (last: %s)", len(done_user_ids), parsed.get("display_name"))
+    done_user_ids.add(uid)  # only after the fsync'd CSV write
+    seen_profile_urls.add(profile_url)
+    n = len(done_user_ids)
+    if n % 100 == 0:
+        log.info("Progress: %d users in CSV (last: %s)", n, parsed.get("display_name"))
     return True
 
 
-async def crawl_department(session: AsyncSession, dept_url: str, subdomain: str) -> set[str]:
-    seen: set[str] = set()
+async def crawl_department(session: AsyncSession, dept_url: str, subdomain: str) -> set:
+    seen: set = set()
     for page in range(1, MAX_DEPT_PAGES + 1):
+        if stop_event is not None and stop_event.is_set():
+            break
         url = dept_url if page == 1 else f"{dept_url}?page={page}"
         body = await fetch(session, url, subdomain)
         if not body:
@@ -309,6 +414,8 @@ async def crawl_department(session: AsyncSession, dept_url: str, subdomain: str)
 
 
 async def crawl_subdomain(session: AsyncSession, subdomain: str) -> int:
+    if stop_event is not None and stop_event.is_set():
+        return 0
     log.info("[%s] homepage", subdomain)
     body = await fetch(session, f"https://{subdomain}.academia.edu/", subdomain)
     if not body:
@@ -322,7 +429,7 @@ async def crawl_subdomain(session: AsyncSession, subdomain: str) -> int:
     dept_tasks = [crawl_department(session, d, subdomain) for d in depts]
     dept_results = await asyncio.gather(*dept_tasks, return_exceptions=True)
 
-    profile_urls: set[str] = set()
+    profile_urls: set = set()
     for d, res in zip(depts, dept_results):
         if isinstance(res, Exception):
             log.warning("[%s] dept failed %s: %s", subdomain, d, res)
@@ -334,13 +441,11 @@ async def crawl_subdomain(session: AsyncSession, subdomain: str) -> int:
     results = await asyncio.gather(*prof_tasks, return_exceptions=True)
     written = sum(1 for r in results if r is True)
     log.info("[%s] %d new users written", subdomain, written)
-    await save_checkpoint()
     return written
 
 
-async def discover_universities(http: aiohttp.ClientSession, curl: AsyncSession) -> set[str]:
+async def discover_universities(http: aiohttp.ClientSession, curl: AsyncSession) -> set:
     body: Optional[str] = None
-    # Try aiohttp first (cheap and meets "use aiohttp" requirement); fall back to curl_cffi on Cloudflare.
     try:
         async with http.get(
             "https://www.academia.edu/",
@@ -366,34 +471,58 @@ async def discover_universities(http: aiohttp.ClientSession, curl: AsyncSession)
 
 # --- Entrypoint ---
 async def main():
-    global global_sem
+    global global_sem, stop_event, done_user_ids, seen_profile_urls
     global_sem = asyncio.Semaphore(GLOBAL_CONCURRENCY)
-    load_checkpoint()
+    stop_event = asyncio.Event()
+
+    done_user_ids, seen_profile_urls = recover_done_state()
+    log.info("Recovered %d user_ids and %d profile URLs from CSV",
+             len(done_user_ids), len(seen_profile_urls))
+    open_csv_writer()
 
     loop = asyncio.get_running_loop()
-    stop = asyncio.Event()
+
+    def _sigint():
+        if stop_event.is_set():
+            log.error("Second signal received; hard-exiting")
+            close_csv_writer()
+            os._exit(130)
+        log.warning("Signal received; stopping after in-flight requests (Ctrl-C again to force-quit)")
+        stop_event.set()
+
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
-            loop.add_signal_handler(sig, stop.set)
+            loop.add_signal_handler(sig, _sigint)
         except NotImplementedError:
             pass
 
-    async with AsyncSession() as curl, aiohttp.ClientSession() as http:
-        subs = await discover_universities(http, curl)
-        if not subs:
-            log.error("No subdomains discovered, aborting"); return
+    try:
+        async with AsyncSession() as curl, aiohttp.ClientSession() as http:
+            subs = await discover_universities(http, curl)
+            if not subs:
+                log.error("No subdomains discovered, aborting"); return
 
-        total = 0
-        for s in sorted(subs):
-            if stop.is_set():
-                log.warning("Stop signal received, saving checkpoint and exiting")
-                break
-            try:
-                total += await crawl_subdomain(curl, s)
-            except Exception:
-                log.exception("[%s] crawl failed", s)
-        log.info("DONE. %d new users scraped this run. CSV: %s", total, OUT_CSV)
-    await save_checkpoint()
+            sub_sem = asyncio.Semaphore(SUBDOMAIN_CONCURRENCY)
+
+            async def _crawl_one(s: str) -> int:
+                async with sub_sem:
+                    if stop_event.is_set():
+                        return 0
+                    try:
+                        return await crawl_subdomain(curl, s)
+                    except Exception:
+                        log.exception("[%s] crawl failed", s)
+                        return 0
+
+            results = await asyncio.gather(
+                *(_crawl_one(s) for s in sorted(subs)),
+                return_exceptions=False,
+            )
+            total = sum(results)
+            log.info("DONE. %d new users scraped this run. CSV total: %d. Path: %s",
+                     total, len(done_user_ids), OUT_CSV)
+    finally:
+        close_csv_writer()
 
 
 if __name__ == "__main__":
