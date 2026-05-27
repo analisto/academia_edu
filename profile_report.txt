@@ -1,0 +1,182 @@
+File: /Users/ismatsamadov/Documents/academia_edu/data/data.snapshot.csv
+Size: 120.4 MB
+Rows: 324,775  Columns: 24
+Columns: ['subdomain', 'university_id', 'university_name', 'department_id', 'department_name', 'department_url', 'user_id', 'page_name', 'display_name', 'first_name', 'middle_initials', 'last_name', 'profile_url', 'photo_url', 'has_photo', 'created_at', 'followers_count', 'following_count', 'papers_count', 'about', 'public_email', 'author_rank', 'bragworthy', 'scraped_at']
+
+======================================================================
+PER-SUBDOMAIN COVERAGE (the single most important context)
+======================================================================
+Distinct subdomains: 89
+  ucla                        10,279  ( 3.16%)
+  hku-hk                       9,632  ( 2.97%)
+  mq                           9,218  ( 2.84%)
+  sfu                          8,758  ( 2.70%)
+  nottingham                   8,531  ( 2.63%)
+  utexas                       8,214  ( 2.53%)
+  sjsu                         7,578  ( 2.33%)
+  oxford                       7,459  ( 2.30%)
+  usc                          7,213  ( 2.22%)
+  nyu                          7,001  ( 2.16%)
+  florida                      6,581  ( 2.03%)
+  utoronto                     6,427  ( 1.98%)
+  leeds                        6,356  ( 1.96%)
+  ucl                          6,264  ( 1.93%)
+  uci                          6,198  ( 1.91%)
+  warwick                      6,193  ( 1.91%)
+  umich                        5,624  ( 1.73%)
+  cmu                          5,586  ( 1.72%)
+  ucalgary                     5,481  ( 1.69%)
+  westernu                     5,445  ( 1.68%)
+  ... 69 more subdomains
+
+Largest subdomain (ucla) = 3.16% of rows
+
+======================================================================
+PER-UNIVERSITY ROW COUNTS (top 20)
+======================================================================
+  536        University of California, Los Angeles                            10,279
+  566        The University of Hong Kong                                       9,632
+  586        Macquarie University                                              9,218
+  563        Simon Fraser University                                           8,758
+  481        University of Nottingham                                          8,531
+  98         The University of Texas at Austin                                 8,214
+  1437       San Jose State University                                         7,578
+  33         University of Oxford                                              7,459
+  474        University of Southern California                                 7,213
+  72         New York University                                               7,001
+  61         University of Florida                                             6,581
+  355        University of Toronto                                             6,427
+  59894      University of Leeds                                               6,356
+  111        University College London                                         6,264
+  694        University of California, Irvine                                  6,198
+  525        University of Warwick                                             6,193
+  493        University of Michigan                                            5,624
+  94         Carnegie Mellon University                                        5,586
+  666        University of Calgary                                             5,481
+  80019      Western University Canada                                         5,445
+
+======================================================================
+CROSS-COLUMN CONSISTENCY
+======================================================================
+Subdomains mapping to >1 university_id: 0
+university_ids with >1 university_name: 0
+(university_id, department_id) pairs with >1 department_name: 0
+Rows where subdomain != extracted-from-profile_url: 0
+`has_photo == False` iff placeholder photo URL: 324,775 / 324,775 agree
+
+======================================================================
+DUPLICATE CHECKS
+======================================================================
+Duplicate user_id rows:                  0
+Duplicate (subdomain, page_name) rows:   0
+Duplicate profile_url rows:              0
+
+======================================================================
+MISSING / EMPTY RATES (% of total rows)
+======================================================================
+  department_name                 2  ( 0.00%)
+  first_name                     13  ( 0.00%)
+  middle_initials           321,520  (99.00%)
+  last_name                      15  ( 0.00%)
+  followers_count           167,918  (51.70%)
+  following_count            54,991  (16.93%)
+  papers_count              279,234  (85.98%)
+  about                     307,322  (94.63%)
+  public_email              313,285  (96.46%)
+  author_rank                 2,025  ( 0.62%)
+  bragworthy                  2,025  ( 0.62%)
+
+======================================================================
+NUMERIC DISTRIBUTIONS (empty → 0 for engagement fields)
+======================================================================
+
+  followers_count
+    min             0.0
+    25%             0.0
+    50%             0.0
+    75%             5.0
+    90%            24.0
+    99%           150.0
+    max       255,610.0
+    mean           15.6
+
+  following_count
+    min             0.0
+    25%             1.0
+    50%             1.0
+    75%             5.0
+    90%            22.0
+    99%            99.0
+    max         2,924.0
+    mean            8.0
+
+  papers_count
+    min             0.0
+    25%             0.0
+    50%             0.0
+    75%             0.0
+    90%             1.0
+    99%            65.0
+    max         1,515.0
+    mean            2.6
+
+======================================================================
+AUTHOR RANK & BRAGWORTHY
+======================================================================
+author_rank == 1 (floor):       320,030  (98.54%)
+author_rank > 1  (ranked):        2,720  ( 0.84%)
+  ranked subset: min=1.00 median=1.99 max=22.84
+bragworthy == True:               2,811  (0.8655%)
+
+======================================================================
+PHOTO COMPLETENESS
+======================================================================
+has_photo == True:              111,940  (34.47%)
+
+======================================================================
+ACCOUNT CREATION BY YEAR
+======================================================================
+  2007          13
+  2008         672
+  2009       1,898
+  2010       4,826
+  2011       7,483
+  2012       8,412
+  2013      22,096
+  2014      34,759
+  2015      28,456
+  2016      13,091
+  2017       5,717
+  2018      28,642
+  2019      91,333
+  2020      72,225
+  2021       2,879
+  2022         640
+  2023         537
+  2024         509
+  2025         447
+  2026         140
+
+======================================================================
+PER-DEPARTMENT ROW COUNTS (top 20)
+======================================================================
+  University of California, Los  / Computer Science                         995
+  Macquarie University / Business \u0026 Economics                          994
+  The University of Hong Kong / Faculty of Business and Economics           989
+  New York University / Computer Science                                    989
+  University of California, Irvi / Biological Sciences                      988
+  Simon Fraser University / Beedie School of Business                       988
+  University of Nottingham / Business School                                988
+  University of Southern Califor / Computer Science                         985
+  University of California, Los  / Chemistry and Biochemistry               984
+  University College London / Bartlett School of Architecture, Bu           983
+  University of Warwick / Economics                                         983
+  The University of Hong Kong / Faculty of Education                        983
+  University of Melbourne / Arts                                            980
+  University of Oxford / Business                                           974
+  The University of Texas at Aus / Computer Science                         965
+  University of Chicago / Economics                                         929
+  University College London / Anthropology                                  895
+  Macquarie University / Faculty of Arts                                    846
+  Australian Catholic University / Faculty of Education                     821
+  University of Oxford / Chemistry                                          802
